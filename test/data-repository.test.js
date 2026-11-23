@@ -1,5 +1,5 @@
 const DataRepository = require('../src/db/repo/data')
-const { DatabaseError } = require('../src/utils/errors')
+const { DatabaseError, ValidationError } = require('../src/utils/errors')
 
 // Mock dependencies
 jest.mock('../src/utils/logger', () => ({
@@ -138,6 +138,23 @@ describe('DataRepository Error Handling', () => {
         expect.stringContaining('WHERE t."status" = $1'),
         ['ACTIVE', 'the_geom', 5000, 100]
       )
+    })
+
+    test('should surface undefined_column (42703) as ValidationError (400)', async () => {
+      const pgError = Object.assign(new Error('column t.S does not exist'), { code: '42703' })
+      mockDb.oneOrNone.mockRejectedValue(pgError)
+
+      await expect(repository.createGeoJson(
+        'objectid', 'shape', 2272, 'public.dor_parcel', 10, 0
+      )).rejects.toThrow(ValidationError)
+
+      try {
+        await repository.createGeoJson('objectid', 'shape', 2272, 'public.dor_parcel', 10, 0)
+      } catch (error) {
+        expect(error.statusCode).toBe(400)
+        expect(error.message).toBe('Invalid query: column t.S does not exist')
+        expect(error.details.pgCode).toBe('42703')
+      }
     })
 
     test('getCount should return integer count', async () => {

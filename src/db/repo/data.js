@@ -1,9 +1,21 @@
 const { table: sql } = require('../sql')
 const { createLogger } = require('../../utils/logger')
-const { DatabaseError } = require('../../utils/errors')
+const { DatabaseError, ValidationError } = require('../../utils/errors')
 const { quoteIdentifier } = require('../../utils/queryBuilder')
 
 const log = createLogger('DataRepository')
+
+// PostgreSQL SQLSTATE codes that indicate a client query error (HTTP 400) rather than a server failure
+// https://www.postgresql.org/docs/current/errcodes-appendix.html
+const CLIENT_SQLSTATE_CODES = new Set([
+  '42703', // undefined_column
+  '42883', // undefined_function (e.g. incompatible types for operator)
+  '42601', // syntax_error
+  '22P02', // invalid_text_representation
+  '22003', // numeric_value_out_of_range
+  '22007', // invalid_datetime_format
+  '22008' // datetime_field_overflow
+])
 
 function formatTableName (tableRef) {
   const parts = String(tableRef).split('.')
@@ -46,6 +58,14 @@ class DataRepository {
       const result = await this.db.one(query, params)
       return result.count
     } catch (error) {
+      if (error instanceof ValidationError) throw error
+      if (error && CLIENT_SQLSTATE_CODES.has(error.code)) {
+        throw new ValidationError(`Invalid query: ${error.message}`, {
+          table: tableRef,
+          pgCode: error.code
+        })
+      }
+
       const dbError = new DatabaseError(
         'Failed to count PostGIS features',
         error,
@@ -108,6 +128,14 @@ class DataRepository {
       const result = await this.db.oneOrNone(query, queryParams)
       return result ? result.jsonb_build_object : null
     } catch (error) {
+      if (error instanceof ValidationError) throw error
+      if (error && CLIENT_SQLSTATE_CODES.has(error.code)) {
+        throw new ValidationError(`Invalid query: ${error.message}`, {
+          table: values,
+          pgCode: error.code
+        })
+      }
+
       const dbError = new DatabaseError(
         'Failed to create GeoJSON from PostGIS data',
         error,
