@@ -77,6 +77,18 @@ describe('DataRepository Error Handling', () => {
 
       expect(result).toBeNull()
     })
+
+    test('should cache valid geometry column metadata across calls', async () => {
+      const expectedResult = { f_geometry_column: 'shape', srid: 2272 }
+      mockDb.oneOrNone.mockResolvedValueOnce(expectedResult)
+
+      const first = await repository.getGeometryColumnName('public', 'dor_parcel')
+      const second = await repository.getGeometryColumnName('public', 'dor_parcel')
+
+      expect(first).toEqual(expectedResult)
+      expect(second).toEqual(expectedResult)
+      expect(mockDb.oneOrNone).toHaveBeenCalledTimes(1)
+    })
   })
 
   describe('createGeoJson', () => {
@@ -211,6 +223,32 @@ describe('DataRepository Error Handling', () => {
       expect(sql).toContain("jsonb_build_object('objectid', t.\"objectid\") AS properties")
       expect(sql).not.toContain('to_jsonb(t)')
       expect(params).toEqual([-8368325, 4858337, -8367714, 4858949, 3857, 2272, 2000, 0])
+    })
+
+    test('should support single-pass abortOnExceedLimit CTE for tile queries', async () => {
+      mockDb.oneOrNone.mockResolvedValue({
+        jsonb_build_object: {
+          type: 'FeatureCollection',
+          features: [],
+          _exceededTransferLimit: true
+        }
+      })
+
+      const result = await repository.createGeoJson('objectid', 'shape', 2272, 'public.rtt_summary', 2000, 0, {
+        whereSql: 'WHERE ST_Intersects(t."shape", ST_Transform(ST_MakeEnvelope($1, $2, $3, $4, $5), $6))',
+        orderBySql: 't."objectid" ASC',
+        params: [-8368325, 4858337, -8367714, 4858949, 3857, 2272],
+        outFields: ['objectid'],
+        abortOnExceedLimit: true
+      })
+
+      const [sql, params] = mockDb.oneOrNone.mock.calls[0]
+      expect(sql).toContain('WITH matched AS MATERIALIZED')
+      expect(sql).toContain('overflow AS')
+      expect(sql).toContain('WHERE NOT (SELECT exceeded FROM overflow)')
+      expect(sql).toContain("'_exceededTransferLimit'")
+      expect(params).toEqual([-8368325, 4858337, -8367714, 4858949, 3857, 2272, 2000, 0, 2001])
+      expect(result._exceededTransferLimit).toBe(true)
     })
 
     test('hasMoreThan should check OFFSET limit LIMIT 1', async () => {

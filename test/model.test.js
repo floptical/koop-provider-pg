@@ -248,7 +248,7 @@ describe('Model Error Handling', () => {
       model.getData(req, callback)
     })
 
-    test('should short-circuit with exceededTransferLimit when returnExceededLimitFeatures=false and tile exceeds limit', (done) => {
+    test('should use single-pass abortOnExceedLimit when returnExceededLimitFeatures=false', (done) => {
       const req = {
         path: '/pg/rest/services/public.rtt_summary/FeatureServer/0/query',
         params: { id: 'public.rtt_summary', layer: '0' },
@@ -264,14 +264,29 @@ describe('Model Error Handling', () => {
         f_geometry_column: 'shape',
         srid: 2272
       })
-      db.data.hasMoreThan.mockResolvedValue(true)
+      db.data.createGeoJson.mockResolvedValue({
+        type: 'FeatureCollection',
+        features: [],
+        _exceededTransferLimit: true
+      })
 
       const callback = (error, result) => {
         try {
           expect(error).toBeNull()
-          expect(db.data.hasMoreThan).toHaveBeenCalled()
-          expect(db.data.createGeoJson).not.toHaveBeenCalled()
+          expect(db.data.createGeoJson).toHaveBeenCalledWith(
+            'gid',
+            'shape',
+            2272,
+            'public.rtt_summary',
+            2000,
+            0,
+            expect.objectContaining({
+              outFields: ['gid', 'objectid'],
+              abortOnExceedLimit: true
+            })
+          )
           expect(result.features).toEqual([])
+          expect(result._exceededTransferLimit).toBeUndefined()
           expect(result.metadata.exceededTransferLimit).toBe(true)
           done()
         } catch (e) {

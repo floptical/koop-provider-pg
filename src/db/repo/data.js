@@ -5,6 +5,8 @@ const { quoteIdentifier } = require('../../utils/queryBuilder')
 
 const log = createLogger('DataRepository')
 
+const GEOM_CACHE_TTL_MS = 5 * 60 * 1000
+
 // PostgreSQL SQLSTATE codes that indicate a client query error (HTTP 400) rather than a server failure
 // https://www.postgresql.org/docs/current/errcodes-appendix.html
 const CLIENT_SQLSTATE_CODES = new Set([
@@ -29,14 +31,28 @@ class DataRepository {
   constructor (db, pgp) {
     this.db = db
     this.pgp = pgp
+    this.geomColumnCache = new Map()
   }
 
   async getGeometryColumnName (schema, table) {
+    const cacheKey = `${schema}.${table}`
+    const cached = this.geomColumnCache.get(cacheKey)
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.value
+    }
+
     try {
       const result = await this.db.oneOrNone(sql.getGeometryColumnName, {
         schema: schema,
         table: table
       })
+
+      if (result && result.f_geometry_column && result.srid) {
+        this.geomColumnCache.set(cacheKey, {
+          value: result,
+          expiresAt: Date.now() + GEOM_CACHE_TTL_MS
+        })
+      }
 
       return result
     } catch (error) {
@@ -232,7 +248,8 @@ class DataRepository {
         params = [],
         outFields = null,
         returnGeometry = true,
-        materializeFilter = false
+        materializeFilter = false,
+        abortOnExceedLimit = false
       } = queryOptions
       const quotedId = quoteIdentifier(id, 'id')
       const quotedGeom = quoteIdentifier(geom, 'geometry column')
@@ -269,54 +286,97 @@ class DataRepository {
       const offsetParam = `$${queryParams.length + 1}`
       queryParams.push(offset)
 
-      // When materializeFilter is enabled (e.g. spatial tile query already verified to have
-      // <= limit rows), materialize the WHERE clause first so PostgreSQL uses the GiST spatial
-      // index and sorts the small result set in memory rather than scanning the PK index.
-      const filteredCte = materializeFilter && whereSql
-        ? `
-        WITH matched AS MATERIALIZED (
-          SELECT t.*
-          FROM ${quotedTable} t
-          ${whereSql}
-        ),
-        filtered AS (
-          SELECT
-            t.${quotedId} AS _feature_id,
-            ${geomExpr} AS geometry,
-            ${propsExpr} AS properties
-          FROM matched t
-          ${orderByClause}
-          LIMIT ${limitParam} OFFSET ${offsetParam}
-        ),`
-        : `
-        WITH filtered AS (
-          SELECT
-            t.${quotedId} AS _feature_id,
-            ${geomExpr} AS geometry,
-            ${propsExpr} AS properties
-          FROM ${quotedTable} t
-          ${whereSql}
-          ${orderByClause}
-          LIMIT ${limitParam} OFFSET ${offsetParam}
-        ),`
-
-      const query = `
-        ${filteredCte}
-        features AS (
+      let query
+      if (abortOnExceedLimit) {
+        // Single-pass tile query for returnExceededLimitFeatures=false:
+        // Materializes up to limit + 1 rows via the GiST spatial index in one scan.
+        // If > limit rows match, skips geometry transform/serialization and returns empty + exceeded flag.
+        const probeLimitParam = `$${queryParams.length + 1}`
+        queryParams.push(limit + 1)
+        query = `
+          WITH matched AS MATERIALIZED (
+            SELECT t.*
+            FROM ${quotedTable} t
+            ${whereSql}
+            LIMIT ${probeLimitParam}
+          ),
+          overflow AS (
+            SELECT (COUNT(*) > ${limitParam}) AS exceeded
+            FROM matched
+          ),
+          filtered AS (
+            SELECT
+              t.${quotedId} AS _feature_id,
+              ${geomExpr} AS geometry,
+              ${propsExpr} AS properties
+            FROM matched t
+            WHERE NOT (SELECT exceeded FROM overflow)
+            ${orderByClause}
+            LIMIT ${limitParam} OFFSET ${offsetParam}
+          ),
+          features AS (
+            SELECT jsonb_build_object(
+              'type', 'Feature',
+              'id', _feature_id,
+              'geometry', geometry,
+              'properties', properties
+            ) AS feature
+            FROM filtered
+          )
           SELECT jsonb_build_object(
-            'type', 'Feature',
-            'id', _feature_id,
-            'geometry', geometry,
-            'properties', properties
-          ) AS feature
-          FROM filtered
-        )
-        SELECT jsonb_build_object(
-          'type', 'FeatureCollection',
-          'features', COALESCE(jsonb_agg(feature), '[]'::jsonb)
-        ) AS jsonb_build_object
-        FROM features;
-      `
+            'type', 'FeatureCollection',
+            'features', COALESCE(jsonb_agg(feature), '[]'::jsonb),
+            '_exceededTransferLimit', (SELECT exceeded FROM overflow)
+          ) AS jsonb_build_object
+          FROM features;
+        `
+      } else {
+        const filteredCte = materializeFilter && whereSql
+          ? `
+          WITH matched AS MATERIALIZED (
+            SELECT t.*
+            FROM ${quotedTable} t
+            ${whereSql}
+          ),
+          filtered AS (
+            SELECT
+              t.${quotedId} AS _feature_id,
+              ${geomExpr} AS geometry,
+              ${propsExpr} AS properties
+            FROM matched t
+            ${orderByClause}
+            LIMIT ${limitParam} OFFSET ${offsetParam}
+          ),`
+          : `
+          WITH filtered AS (
+            SELECT
+              t.${quotedId} AS _feature_id,
+              ${geomExpr} AS geometry,
+              ${propsExpr} AS properties
+            FROM ${quotedTable} t
+            ${whereSql}
+            ${orderByClause}
+            LIMIT ${limitParam} OFFSET ${offsetParam}
+          ),`
+
+        query = `
+          ${filteredCte}
+          features AS (
+            SELECT jsonb_build_object(
+              'type', 'Feature',
+              'id', _feature_id,
+              'geometry', geometry,
+              'properties', properties
+            ) AS feature
+            FROM filtered
+          )
+          SELECT jsonb_build_object(
+            'type', 'FeatureCollection',
+            'features', COALESCE(jsonb_agg(feature), '[]'::jsonb)
+          ) AS jsonb_build_object
+          FROM features;
+        `
+      }
 
       const result = await this.db.oneOrNone(query, queryParams)
       return result ? result.jsonb_build_object : null
