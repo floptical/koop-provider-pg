@@ -4,6 +4,7 @@ const {
   parseObjectIds,
   parseSpatialFilter,
   parseOrderByFields,
+  parseOutFields,
   buildQueryOptions
 } = require('../src/utils/queryBuilder')
 const { ValidationError } = require('../src/utils/errors')
@@ -124,6 +125,39 @@ describe('queryBuilder', () => {
         limit: true,
         offset: true
       })
+    })
+
+    test('strips trivial where=1=1, parses outFields, and handles returnExceededLimitFeatures=false', () => {
+      const opts = buildQueryOptions(
+        {
+          where: '1=1',
+          outFields: 'stnam,objectid',
+          returnExceededLimitFeatures: 'false',
+          geometry: '-75.2,39.9,-75.1,40.0'
+        },
+        { idColumn: 'objectid', geomColumn: 'shape', tableSrid: 2272, maxLimit: 2000 }
+      )
+
+      expect(opts.whereSql).toContain('ST_Intersects')
+      expect(opts.whereSql).not.toContain('$1 = $2')
+      expect(opts.orderBySql).toBe('')
+      expect(opts.outFields).toEqual(['objectid', 'stnam'])
+      expect(opts.returnExceededLimitFeatures).toBe(false)
+      expect(opts.filtersApplied.where).toBe(true)
+      expect(opts.filtersApplied.geometry).toBe(true)
+    })
+  })
+
+  describe('parseOutFields', () => {
+    test('returns null for wildcard or empty', () => {
+      expect(parseOutFields('*', 'objectid')).toBeNull()
+      expect(parseOutFields('', 'objectid')).toBeNull()
+      expect(parseOutFields(undefined, 'objectid')).toBeNull()
+    })
+
+    test('always includes idColumn and rejects invalid identifiers', () => {
+      expect(parseOutFields('stnam, zip', 'objectid')).toEqual(['objectid', 'stnam', 'zip'])
+      expect(() => parseOutFields('bad; DROP TABLE x', 'objectid')).toThrow(ValidationError)
     })
   })
 })

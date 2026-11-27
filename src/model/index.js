@@ -94,7 +94,10 @@ class Model {
       // Service/layer metadata requests (e.g. /FeatureServer or /FeatureServer/0 without /query)
       // only need a single sample row for Koop to infer field types and geometryType, paired with
       // the full table extent from PostGIS.
-      const isMetadataOnly = !reqParams.method &&
+      const reqPath = (req && (req.path || req.originalUrl)) || ''
+      const isQueryEndpoint = reqParams.method === 'query' || /\/query(\?|$)/i.test(reqPath)
+
+      const isMetadataOnly = !isQueryEndpoint &&
         !reqQuery.where &&
         !reqQuery.objectIds &&
         !reqQuery.geometry &&
@@ -102,20 +105,53 @@ class Model {
         reqQuery.resultOffset === undefined
 
       const effectiveLimit = isMetadataOnly ? 1 : queryOpts.limit
-      // Fetch one extra row when limit pushdown is active so we can accurately report exceededTransferLimit
-      const sqlLimit = (!isMetadataOnly && queryOpts.filtersApplied.limit)
-        ? effectiveLimit + 1
-        : effectiveLimit
 
       log.info('Processing feature request', {
         table: fullTable,
         layer: reqParams.layer,
-        method: reqParams.method || 'metadata',
+        method: isQueryEndpoint ? 'query' : (reqParams.method || 'metadata'),
         where: reqQuery.where,
+        outFields: reqQuery.outFields,
         hasGeometry: Boolean(reqQuery.geometry),
+        returnExceededLimitFeatures: queryOpts.returnExceededLimitFeatures,
         limit: effectiveLimit,
         offset: queryOpts.offset
       })
+
+      // Fast path for AGOL tile queries (returnExceededLimitFeatures=false):
+      // check if the tile exceeds effectiveLimit before transforming/serializing geometries.
+      let materializeFilter = false
+      if (!isMetadataOnly && !queryOpts.returnExceededLimitFeatures && queryOpts.filtersApplied.limit) {
+        const exceeded = await db.data.hasMoreThan(
+          fullTable,
+          queryOpts.whereSql,
+          queryOpts.params,
+          effectiveLimit
+        )
+        if (exceeded) {
+          return callback(null, {
+            type: 'FeatureCollection',
+            features: [],
+            description: 'PG Koop Feature Service',
+            filtersApplied: { all: true },
+            metadata: {
+              title: schema,
+              name: fullTable,
+              description: 'This feature layer generated with Koop PostGIS Provider (koop-provider-pg), for more information visit https://github.com/doneill/koop-provider-pg',
+              idField: id,
+              maxRecordCount: maxLimit,
+              exceededTransferLimit: true
+            }
+          })
+        }
+        // Safe to materialize spatial filter because we verified <= effectiveLimit rows match
+        materializeFilter = Boolean(queryOpts.filtersApplied.geometry)
+      }
+
+      // Fetch one extra row when limit pushdown is active so we can accurately report exceededTransferLimit
+      const sqlLimit = (!isMetadataOnly && queryOpts.filtersApplied.limit && !materializeFilter)
+        ? effectiveLimit + 1
+        : effectiveLimit
 
       const [geojson, extent] = await Promise.all([
         db.data.createGeoJson(
@@ -128,7 +164,10 @@ class Model {
           {
             whereSql: queryOpts.whereSql,
             orderBySql: queryOpts.orderBySql,
-            params: queryOpts.params
+            params: queryOpts.params,
+            outFields: isMetadataOnly ? null : queryOpts.outFields,
+            returnGeometry: isMetadataOnly ? true : queryOpts.returnGeometry,
+            materializeFilter
           }
         ),
         isMetadataOnly ? db.data.getExtent(schema, table, geom, srid) : Promise.resolve(null)

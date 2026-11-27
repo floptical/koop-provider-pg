@@ -543,6 +543,40 @@ function parseOrderByFields (orderByParam, fallbackIdCol) {
 }
 
 /**
+ * Parse ArcGIS outFields (e.g. "objectid,stnam") into a validated array of column names.
+ * Returns null when all columns should be returned (missing, empty, or "*").
+ * Always includes idColumn so Koop/ArcGIS can identify features.
+ */
+function parseOutFields (outFieldsParam, idColumn) {
+  if (outFieldsParam === undefined || outFieldsParam === null) return null
+  const raw = String(outFieldsParam).trim()
+  if (!raw || raw === '*') return null
+
+  const rawFields = raw.split(',').map(f => f.trim()).filter(Boolean)
+  if (rawFields.length === 0 || rawFields.includes('*')) return null
+
+  const seen = new Set()
+  const fields = []
+  const addField = (name) => {
+    // Validate identifier via quoteIdentifier (throws ValidationError if invalid)
+    quoteIdentifier(name, 'outFields column')
+    if (!seen.has(name)) {
+      seen.add(name)
+      fields.push(name)
+    }
+  }
+
+  if (idColumn) {
+    addField(idColumn)
+  }
+  for (const field of rawFields) {
+    addField(field)
+  }
+
+  return fields
+}
+
+/**
  * Build SQL pushdown options and Koop filtersApplied metadata from req.query.
  */
 function buildQueryOptions (reqQuery = {}, { idColumn, geomColumn, tableSrid, maxLimit = 2000 }) {
@@ -550,13 +584,18 @@ function buildQueryOptions (reqQuery = {}, { idColumn, geomColumn, tableSrid, ma
   const params = []
   const filtersApplied = {}
 
-  // 1. WHERE clause
+  // 1. WHERE clause (strip trivial no-op "1=1")
   if (reqQuery.where && String(reqQuery.where).trim()) {
-    const parsed = parseWhereClause(String(reqQuery.where), params.length + 1)
-    if (parsed.sql) {
-      conditions.push(parsed.sql)
-      params.push(...parsed.params)
+    const trimmedWhere = String(reqQuery.where).trim()
+    if (/^1\s*=\s*1$/.test(trimmedWhere)) {
       filtersApplied.where = true
+    } else {
+      const parsed = parseWhereClause(trimmedWhere, params.length + 1)
+      if (parsed.sql) {
+        conditions.push(parsed.sql)
+        params.push(...parsed.params)
+        filtersApplied.where = true
+      }
     }
   }
 
@@ -619,16 +658,33 @@ function buildQueryOptions (reqQuery = {}, { idColumn, geomColumn, tableSrid, ma
     offset = 0
   }
 
+  // Avoid forcing ORDER BY objectid on spatial queries when no sort or offset was requested,
+  // which can trick PostgreSQL into scanning the primary key index instead of the GiST index.
+  const orderBySql = (orderBy.applied || offset > 0 || !filtersApplied.geometry)
+    ? orderBy.sql
+    : ''
+
+  const outFields = parseOutFields(reqQuery.outFields, idColumn)
+
   const returnCountOnly = reqQuery.returnCountOnly === true ||
     String(reqQuery.returnCountOnly).toLowerCase() === 'true'
 
+  const returnGeometry = !(reqQuery.returnGeometry === false ||
+    String(reqQuery.returnGeometry).toLowerCase() === 'false')
+
+  const returnExceededLimitFeatures = !(reqQuery.returnExceededLimitFeatures === false ||
+    String(reqQuery.returnExceededLimitFeatures).toLowerCase() === 'false')
+
   return {
     whereSql: conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '',
-    orderBySql: orderBy.sql,
+    orderBySql,
+    outFields,
     limit,
     offset,
     params,
     returnCountOnly,
+    returnGeometry,
+    returnExceededLimitFeatures,
     filtersApplied
   }
 }
@@ -640,5 +696,6 @@ module.exports = {
   parseObjectIds,
   parseSpatialFilter,
   parseOrderByFields,
+  parseOutFields,
   buildQueryOptions
 }

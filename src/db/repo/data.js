@@ -167,38 +167,112 @@ class DataRepository {
     }
   }
 
+  async hasMoreThan (tableRef, whereSql = '', params = [], limit = 2000) {
+    try {
+      const quotedTable = formatTableName(tableRef)
+      const queryParams = [...params, limit]
+      const offsetParam = `$${queryParams.length}`
+      const query = `SELECT 1 AS hit FROM ${quotedTable} t ${whereSql} OFFSET ${offsetParam} LIMIT 1;`
+      const result = await this.db.oneOrNone(query, queryParams)
+      return Boolean(result)
+    } catch (error) {
+      if (error instanceof ValidationError) throw error
+      if (error && CLIENT_SQLSTATE_CODES.has(error.code)) {
+        throw new ValidationError(`Invalid query: ${error.message}`, {
+          table: tableRef,
+          pgCode: error.code
+        })
+      }
+
+      const dbError = new DatabaseError(
+        'Failed to check PostGIS feature limit',
+        error,
+        { table: tableRef, limit }
+      )
+
+      log.error('Error in hasMoreThan', error, { table: tableRef, limit })
+      throw dbError
+    }
+  }
+
   async createGeoJson (id, geom, srid, values, limit, offset, queryOptions = {}) {
     try {
-      const { whereSql = '', orderBySql = '', params = [] } = queryOptions
+      const {
+        whereSql = '',
+        orderBySql,
+        params = [],
+        outFields = null,
+        returnGeometry = true,
+        materializeFilter = false
+      } = queryOptions
       const quotedId = quoteIdentifier(id, 'id')
       const quotedGeom = quoteIdentifier(geom, 'geometry column')
       const quotedTable = formatTableName(values)
-      const effectiveOrderBy = orderBySql || `t.${quotedId} ASC`
+      const effectiveOrderBy = orderBySql === undefined
+        ? `t.${quotedId} ASC`
+        : orderBySql
+      const orderByClause = effectiveOrderBy ? `ORDER BY ${effectiveOrderBy}` : ''
 
       // GeoJSON (RFC 7946) and Koop expect WGS84 (EPSG:4326) coordinates
-      const geomExpr = Number(srid) === 4326
-        ? `ST_AsGeoJSON(t.${quotedGeom})::jsonb`
-        : `ST_AsGeoJSON(ST_Transform(t.${quotedGeom}, 4326))::jsonb`
+      let geomExpr = 'NULL::jsonb'
+      if (returnGeometry) {
+        geomExpr = Number(srid) === 4326
+          ? `ST_AsGeoJSON(t.${quotedGeom})::jsonb`
+          : `ST_AsGeoJSON(ST_Transform(t.${quotedGeom}, 4326))::jsonb`
+      }
 
       const queryParams = [...params]
-      const geomNameParam = `$${queryParams.length + 1}`
-      queryParams.push(geom)
+      let propsExpr
+      if (Array.isArray(outFields) && outFields.length > 0) {
+        const pairs = outFields.map(field => {
+          const quotedField = quoteIdentifier(field, 'outFields column')
+          return `'${field}', t.${quotedField}`
+        })
+        propsExpr = `jsonb_build_object(${pairs.join(', ')})`
+      } else {
+        const geomNameParam = `$${queryParams.length + 1}`
+        queryParams.push(geom)
+        propsExpr = `to_jsonb(t) - ${geomNameParam}`
+      }
+
       const limitParam = `$${queryParams.length + 1}`
       queryParams.push(limit)
       const offsetParam = `$${queryParams.length + 1}`
       queryParams.push(offset)
 
-      const query = `
+      // When materializeFilter is enabled (e.g. spatial tile query already verified to have
+      // <= limit rows), materialize the WHERE clause first so PostgreSQL uses the GiST spatial
+      // index and sorts the small result set in memory rather than scanning the PK index.
+      const filteredCte = materializeFilter && whereSql
+        ? `
+        WITH matched AS MATERIALIZED (
+          SELECT t.*
+          FROM ${quotedTable} t
+          ${whereSql}
+        ),
+        filtered AS (
+          SELECT
+            t.${quotedId} AS _feature_id,
+            ${geomExpr} AS geometry,
+            ${propsExpr} AS properties
+          FROM matched t
+          ${orderByClause}
+          LIMIT ${limitParam} OFFSET ${offsetParam}
+        ),`
+        : `
         WITH filtered AS (
           SELECT
             t.${quotedId} AS _feature_id,
             ${geomExpr} AS geometry,
-            to_jsonb(t) - ${geomNameParam} AS properties
+            ${propsExpr} AS properties
           FROM ${quotedTable} t
           ${whereSql}
-          ORDER BY ${effectiveOrderBy}
+          ${orderByClause}
           LIMIT ${limitParam} OFFSET ${offsetParam}
-        ),
+        ),`
+
+      const query = `
+        ${filteredCte}
         features AS (
           SELECT jsonb_build_object(
             'type', 'Feature',

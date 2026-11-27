@@ -8,7 +8,8 @@ jest.mock('../src/db', () => ({
       getGeometryColumnName: jest.fn(),
       createGeoJson: jest.fn(),
       getCount: jest.fn(),
-      getExtent: jest.fn()
+      getExtent: jest.fn(),
+      hasMoreThan: jest.fn()
     }
   }
 }))
@@ -238,6 +239,40 @@ describe('Model Error Handling', () => {
           expect(error).toBeNull()
           expect(db.data.getExtent).toHaveBeenCalledWith('public', 'dor_parcel', 'shape', 2272)
           expect(result.metadata.extent).toEqual(mockExtent)
+          done()
+        } catch (e) {
+          done(e)
+        }
+      }
+
+      model.getData(req, callback)
+    })
+
+    test('should short-circuit with exceededTransferLimit when returnExceededLimitFeatures=false and tile exceeds limit', (done) => {
+      const req = {
+        path: '/pg/rest/services/public.rtt_summary/FeatureServer/0/query',
+        params: { id: 'public.rtt_summary', layer: '0' },
+        query: {
+          where: '1=1',
+          geometry: '-75.2,39.9,-75.1,40.0',
+          outFields: 'objectid',
+          returnExceededLimitFeatures: 'false'
+        }
+      }
+
+      db.data.getGeometryColumnName.mockResolvedValue({
+        f_geometry_column: 'shape',
+        srid: 2272
+      })
+      db.data.hasMoreThan.mockResolvedValue(true)
+
+      const callback = (error, result) => {
+        try {
+          expect(error).toBeNull()
+          expect(db.data.hasMoreThan).toHaveBeenCalled()
+          expect(db.data.createGeoJson).not.toHaveBeenCalled()
+          expect(result.features).toEqual([])
+          expect(result.metadata.exceededTransferLimit).toBe(true)
           done()
         } catch (e) {
           done(e)
