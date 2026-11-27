@@ -169,6 +169,32 @@ describe('DataRepository Error Handling', () => {
       )
     })
 
+    test('getCount should use pg_class.reltuples for unfiltered counts on large tables', async () => {
+      mockDb.oneOrNone.mockResolvedValueOnce({ count: '5182058' })
+
+      const count = await repository.getCount('public.rtt_summary', '', [])
+
+      expect(count).toBe(5182058)
+      expect(mockDb.oneOrNone).toHaveBeenCalledWith(
+        expect.stringContaining('pg_class'),
+        ['public', 'rtt_summary']
+      )
+      expect(mockDb.one).not.toHaveBeenCalled()
+    })
+
+    test('getCount should fall back to exact COUNT(*) when pg_class returns null (small table or view)', async () => {
+      mockDb.oneOrNone.mockResolvedValueOnce(null)
+      mockDb.one.mockResolvedValueOnce({ count: 350 })
+
+      const count = await repository.getCount('public.small_table', '', [])
+
+      expect(count).toBe(350)
+      expect(mockDb.one).toHaveBeenCalledWith(
+        'SELECT COUNT(*)::int AS count FROM "public"."small_table" t ;',
+        []
+      )
+    })
+
     test('should push down outFields using jsonb_build_object and support materializeFilter', async () => {
       mockDb.oneOrNone.mockResolvedValue({ jsonb_build_object: { type: 'FeatureCollection', features: [] } })
 

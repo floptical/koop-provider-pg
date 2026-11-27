@@ -54,6 +54,35 @@ class DataRepository {
   async getCount (tableRef, whereSql = '', params = []) {
     try {
       const quotedTable = formatTableName(tableRef)
+
+      // Fast path for unfiltered counts on large tables (>= 10k rows):
+      // avoids a full multi-million-row MVCC scan on AGOL Data tab's where=1=1&returnCountOnly=true.
+      if (!whereSql && process.env.PG_EXACT_COUNT !== 'true') {
+        const parts = String(tableRef).split('.')
+        if (parts.length === 2) {
+          try {
+            const est = await this.db.oneOrNone(
+              `SELECT c.reltuples::bigint AS count
+               FROM pg_class c
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = $1
+                 AND c.relname = $2
+                 AND c.relkind IN ('r', 'p', 'm')
+                 AND c.reltuples >= 10000;`,
+              [parts[0], parts[1]]
+            )
+            if (est && Number.isFinite(Number(est.count))) {
+              return Number(est.count)
+            }
+          } catch (estError) {
+            log.debug('pg_class count estimate unavailable, falling back to COUNT(*)', {
+              table: tableRef,
+              reason: estError.message
+            })
+          }
+        }
+      }
+
       const query = `SELECT COUNT(*)::int AS count FROM ${quotedTable} t ${whereSql};`
       const result = await this.db.one(query, params)
       return result.count
