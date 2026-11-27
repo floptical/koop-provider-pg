@@ -77,6 +77,96 @@ class DataRepository {
     }
   }
 
+  async getExtent (schema, table, geom, srid) {
+    const sridNum = Number(srid)
+    const parseExtentRow = (row) => {
+      if (!row) return null
+      const xmin = Number(row.xmin)
+      const ymin = Number(row.ymin)
+      const xmax = Number(row.xmax)
+      const ymax = Number(row.ymax)
+      if (![xmin, ymin, xmax, ymax].every(Number.isFinite)) return null
+      return {
+        xmin,
+        ymin,
+        xmax,
+        ymax,
+        spatialReference: { wkid: 4326, latestWkid: 4326 }
+      }
+    }
+
+    // Fast path: O(1) lookup via PostGIS table statistics
+    try {
+      const estimatedQuery = `
+        WITH ext AS (
+          SELECT ST_EstimatedExtent($1, $2, $3) AS box
+        ),
+        wgs84 AS (
+          SELECT CASE
+            WHEN box IS NULL THEN NULL
+            WHEN $4 = 4326 THEN ST_SetSRID(box::geometry, 4326)
+            ELSE ST_Transform(ST_SetSRID(box::geometry, $4), 4326)
+          END AS geom
+          FROM ext
+        )
+        SELECT
+          ST_XMin(geom) AS xmin,
+          ST_YMin(geom) AS ymin,
+          ST_XMax(geom) AS xmax,
+          ST_YMax(geom) AS ymax
+        FROM wgs84
+        WHERE geom IS NOT NULL;
+      `
+      const estimated = parseExtentRow(
+        await this.db.oneOrNone(estimatedQuery, [schema, table, geom, sridNum])
+      )
+      if (estimated) return estimated
+    } catch (error) {
+      log.debug('ST_EstimatedExtent unavailable, falling back to ST_Extent', {
+        schema,
+        table,
+        geom,
+        reason: error.message
+      })
+    }
+
+    // Fallback: exact table extent (e.g. views or un-analyzed tables)
+    try {
+      const quotedGeom = quoteIdentifier(geom, 'geometry column')
+      const quotedTable = formatTableName(`${schema}.${table}`)
+      const exactQuery = `
+        WITH ext AS (
+          SELECT ST_Extent(t.${quotedGeom}) AS box
+          FROM ${quotedTable} t
+        ),
+        wgs84 AS (
+          SELECT CASE
+            WHEN box IS NULL THEN NULL
+            WHEN $1 = 4326 THEN ST_SetSRID(box::geometry, 4326)
+            ELSE ST_Transform(ST_SetSRID(box::geometry, $1), 4326)
+          END AS geom
+          FROM ext
+        )
+        SELECT
+          ST_XMin(geom) AS xmin,
+          ST_YMin(geom) AS ymin,
+          ST_XMax(geom) AS xmax,
+          ST_YMax(geom) AS ymax
+        FROM wgs84
+        WHERE geom IS NOT NULL;
+      `
+      return parseExtentRow(await this.db.oneOrNone(exactQuery, [sridNum]))
+    } catch (error) {
+      log.warn('Failed to compute table extent', {
+        schema,
+        table,
+        geom,
+        reason: error.message
+      })
+      return null
+    }
+  }
+
   async createGeoJson (id, geom, srid, values, limit, offset, queryOptions = {}) {
     try {
       const { whereSql = '', orderBySql = '', params = [] } = queryOptions

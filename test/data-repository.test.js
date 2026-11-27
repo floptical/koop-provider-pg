@@ -170,6 +170,69 @@ describe('DataRepository Error Handling', () => {
     })
   })
 
+  describe('getExtent', () => {
+    test('should return WGS84 extent from ST_EstimatedExtent when available', async () => {
+      mockDb.oneOrNone.mockResolvedValueOnce({
+        xmin: -75.28,
+        ymin: 39.86,
+        xmax: -74.95,
+        ymax: 40.14
+      })
+
+      const extent = await repository.getExtent('public', 'dor_parcel', 'shape', 2272)
+
+      expect(extent).toEqual({
+        xmin: -75.28,
+        ymin: 39.86,
+        xmax: -74.95,
+        ymax: 40.14,
+        spatialReference: { wkid: 4326, latestWkid: 4326 }
+      })
+      expect(mockDb.oneOrNone).toHaveBeenCalledTimes(1)
+      expect(mockDb.oneOrNone).toHaveBeenCalledWith(
+        expect.stringContaining('ST_EstimatedExtent($1, $2, $3)'),
+        ['public', 'dor_parcel', 'shape', 2272]
+      )
+    })
+
+    test('should fall back to ST_Extent when ST_EstimatedExtent fails', async () => {
+      mockDb.oneOrNone
+        .mockRejectedValueOnce(new Error('stats for "dor_parcel.shape" do not exist'))
+        .mockResolvedValueOnce({
+          xmin: -75.27,
+          ymin: 39.88,
+          xmax: -74.96,
+          ymax: 40.13
+        })
+
+      const extent = await repository.getExtent('public', 'dor_parcel', 'shape', 2272)
+
+      expect(extent).toEqual({
+        xmin: -75.27,
+        ymin: 39.88,
+        xmax: -74.96,
+        ymax: 40.13,
+        spatialReference: { wkid: 4326, latestWkid: 4326 }
+      })
+      expect(mockDb.oneOrNone).toHaveBeenCalledTimes(2)
+      expect(mockDb.oneOrNone).toHaveBeenNthCalledWith(
+        2,
+        expect.stringContaining('ST_Extent(t."shape")'),
+        [2272]
+      )
+    })
+
+    test('should return null if both extent queries fail', async () => {
+      mockDb.oneOrNone
+        .mockRejectedValueOnce(new Error('estimated failed'))
+        .mockRejectedValueOnce(new Error('exact failed'))
+
+      const extent = await repository.getExtent('public', 'dor_parcel', 'shape', 2272)
+
+      expect(extent).toBeNull()
+    })
+  })
+
   describe('constructor', () => {
     test('should initialize with db and pgp instances', () => {
       const repo = new DataRepository(mockDb, mockPgp)

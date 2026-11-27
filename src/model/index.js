@@ -77,6 +77,11 @@ class Model {
 
       // Fast path for returnCountOnly=true (only when all provided filters were pushed down)
       if (queryOpts.returnCountOnly && (!reqQuery.geometry || queryOpts.filtersApplied.geometry)) {
+        log.info('Processing count request', {
+          table: fullTable,
+          where: reqQuery.where,
+          hasGeometry: Boolean(reqQuery.geometry)
+        })
         const count = await db.data.getCount(fullTable, queryOpts.whereSql, queryOpts.params)
         return callback(null, {
           type: 'FeatureCollection',
@@ -86,14 +91,15 @@ class Model {
         })
       }
 
-      // Layer metadata requests (e.g. /FeatureServer/0 without /query) only need a single
-      // sample row for Koop to infer field types and geometryType
-      const isMetadataOnly = reqParams.layer !== undefined &&
-        !reqParams.method &&
+      // Service/layer metadata requests (e.g. /FeatureServer or /FeatureServer/0 without /query)
+      // only need a single sample row for Koop to infer field types and geometryType, paired with
+      // the full table extent from PostGIS.
+      const isMetadataOnly = !reqParams.method &&
         !reqQuery.where &&
         !reqQuery.objectIds &&
         !reqQuery.geometry &&
-        reqQuery.resultRecordCount === undefined
+        reqQuery.resultRecordCount === undefined &&
+        reqQuery.resultOffset === undefined
 
       const effectiveLimit = isMetadataOnly ? 1 : queryOpts.limit
       // Fetch one extra row when limit pushdown is active so we can accurately report exceededTransferLimit
@@ -101,19 +107,32 @@ class Model {
         ? effectiveLimit + 1
         : effectiveLimit
 
-      const geojson = await db.data.createGeoJson(
-        id,
-        geom,
-        srid,
-        fullTable,
-        sqlLimit,
-        queryOpts.offset,
-        {
-          whereSql: queryOpts.whereSql,
-          orderBySql: queryOpts.orderBySql,
-          params: queryOpts.params
-        }
-      )
+      log.info('Processing feature request', {
+        table: fullTable,
+        layer: reqParams.layer,
+        method: reqParams.method || 'metadata',
+        where: reqQuery.where,
+        hasGeometry: Boolean(reqQuery.geometry),
+        limit: effectiveLimit,
+        offset: queryOpts.offset
+      })
+
+      const [geojson, extent] = await Promise.all([
+        db.data.createGeoJson(
+          id,
+          geom,
+          srid,
+          fullTable,
+          sqlLimit,
+          queryOpts.offset,
+          {
+            whereSql: queryOpts.whereSql,
+            orderBySql: queryOpts.orderBySql,
+            params: queryOpts.params
+          }
+        ),
+        isMetadataOnly ? db.data.getExtent(schema, table, geom, srid) : Promise.resolve(null)
+      ])
 
       if (!geojson || typeof geojson !== 'object' || !geojson.type || !geojson.features) {
         log.warn('Unexpected result from createGeoJson', { schema, table, result: typeof geojson })
@@ -146,6 +165,9 @@ class Model {
           maxRecordCount: maxLimit,
           exceededTransferLimit,
           geometryType: _.get(geojson, 'features[0].geometry.type')
+        }
+        if (extent) {
+          geojson.metadata.extent = extent
         }
       }
 

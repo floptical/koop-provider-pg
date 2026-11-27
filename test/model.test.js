@@ -7,7 +7,8 @@ jest.mock('../src/db', () => ({
     data: {
       getGeometryColumnName: jest.fn(),
       createGeoJson: jest.fn(),
-      getCount: jest.fn()
+      getCount: jest.fn(),
+      getExtent: jest.fn()
     }
   }
 }))
@@ -196,6 +197,47 @@ describe('Model Error Handling', () => {
               geometryType: 'Point'
             })
           }))
+          done()
+        } catch (e) {
+          done(e)
+        }
+      }
+
+      model.getData(req, callback)
+    })
+
+    test('should attach PostGIS table extent to metadata on metadata requests', (done) => {
+      const req = { params: { id: 'public.dor_parcel', layer: '0' }, query: {} }
+      const mockExtent = {
+        xmin: -75.28,
+        ymin: 39.86,
+        xmax: -74.95,
+        ymax: 40.14,
+        spatialReference: { wkid: 4326, latestWkid: 4326 }
+      }
+      const mockGeojson = {
+        type: 'FeatureCollection',
+        features: [
+          {
+            type: 'Feature',
+            geometry: { type: 'Polygon', coordinates: [] },
+            properties: { objectid: 1 }
+          }
+        ]
+      }
+
+      db.data.getGeometryColumnName.mockResolvedValue({
+        f_geometry_column: 'shape',
+        srid: 2272
+      })
+      db.data.createGeoJson.mockResolvedValue(mockGeojson)
+      db.data.getExtent.mockResolvedValue(mockExtent)
+
+      const callback = (error, result) => {
+        try {
+          expect(error).toBeNull()
+          expect(db.data.getExtent).toHaveBeenCalledWith('public', 'dor_parcel', 'shape', 2272)
+          expect(result.metadata.extent).toEqual(mockExtent)
           done()
         } catch (e) {
           done(e)
